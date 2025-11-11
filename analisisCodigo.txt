@@ -1,0 +1,312 @@
+1.Controlador llama a este metodo:
+    @Override
+    public ConsultarSoatResponse orchestratorTariffAndDataRunt(String licencePlate, String vehicleIdNumber, String documentType, BigDecimal documentNumber, Map<String, String> headers) throws NoFoundLicensePlateException {
+        if((Objects.isNull(licencePlate)) || (Objects.isNull(licencePlate) && Objects.isNull(vehicleIdNumber)))
+            throw new PriceSoatException(CommonsUtil.ERROR_IT_IS_NECESSARY_TO_INDICATE_THE_LICENSE_PLATE_OR_THE_VIN);
+
+        HeaderConsultSoatDto currentContextHeaderConsultSoat = CurrentContext.getCurrentContextHeaderConsultSoat();
+        HeaderSoatTariffDto headerSoatTariffDto = CurrentContext.getCurrentContextHeaderSoatTariff();
+
+        ValidarRegistroRuntRequest request = new ValidarRegistroRuntRequest();
+        request.setLicencePlate(licencePlate);
+        request.setDocumentNumber(documentNumber);
+        request.setVehicleIdNumber(vehicleIdNumber);
+        request.setDocumentType(documentType);
+
+        String typeOfQuery = getRuntQueryType(request);
+
+        //VehicleRuntData runtDataDynamo = getVehicleRuntDataDynamo(licencePlate);
+        VehicleRuntData runtDataDynamo = null;
+        ProcedureOutTarifSoatParamsDto procedureOutTarifSoatParamsDto = null;
+        Date starDate = null;
+        Date endDate = null;
+
+        ValidarRegistroRuntCommonsResponse dataRunt = validateSearchVehicleData(headers, runtDataDynamo, request);
+        ResponseDataRuntBody data = dataRunt.getData();
+
+        validateDataRunt(typeOfQuery, data);
+
+
+        if (Objects.isNull(data.getSoatExpirationDate())) {
+            data.setSoatExpirationDate(CommonsUtil.formatDateDefault(new Date()));
+        }
+        Date soatExpirationDate = CommonsUtil.converterStringDate(CommonsUtil.FORMAT_YYYY_MM_DD_HH_MM, CommonsUtil.changeValidDateFormat(data.getSoatExpirationDate()));
+        Long diff = CommonsUtil.differenceDaysBetweenTwoDates(soatExpirationDate);
+        log.info("LONG diff ::::::: {}", diff);
+
+        SimTypProcesoType processTypePL = new GenerateObjectMapper<SimTypProcesoType>().generatedMapperDTO(CommonsUtil.buildSimTypProcess(headerSoatTariffDto), SimTypProcesoType.class);
+        var respAdapter = AdapterTronadorDaysAdvResTypeDto.builder()
+                .response(Collections.singletonList(getDaysAdvance(processTypePL, currentContextHeaderConsultSoat)))
+                .build();
+
+        var daysAdvance = validateDaysAdvance(validateRespDaysAdv(respAdapter.getResponse()));
+        data.setDaysAdvance(daysAdvance);//Atributo dias de anticipacion en respuesta
+
+        assert daysAdvance != null;
+        if (diff <= daysAdvance.longValue()) {
+
+            log.info("DATE BEFORE EXP SOAT ::::::: {}", soatExpirationDate);
+            starDate = CommonsUtil.calculateNewSoatStartDate(soatExpirationDate);
+            log.info(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> LA FECHA INICIO ES {}", starDate);
+            endDate = CommonsUtil.calculateNewSoatEndDate(starDate);
+
+            ConsultarTarifacionSoatRequest tariffRequest = buildSoatTarifacionRequest(data, starDate, endDate);
+            UtilitiesRunt.validateTariffRequest(tariffRequest);
+            try {
+                procedureOutTarifSoatParamsDto = consultSoatTariff(postConsultTariff(urlCommonsvehicle + urlConsultSoatTariff, tariffRequest, headers)).getData();
+            } catch (IOException ex) {
+                throw new SoatTariffException(CommonsUtil.ERRORS_PL_PRC_VALORES_SOAT);
+            }
+        }
+
+        var response = buildResponsePriceSoatDto(dataRunt, procedureOutTarifSoatParamsDto, starDate, endDate);
+        //saveVehicleOnDynamo(response); DESCOMENTAREAR
+
+        return response;
+    }
+2. metodo que se encarga de obtener un objeto dataRunt
+    private ValidarRegistroRuntCommonsResponse validateSearchVehicleData(Map<String, String> headers, VehicleRuntData runtDataDynamo, ValidarRegistroRuntRequest request) {
+        ValidarRegistroRuntCommonsResponse dataRunt;
+        try {
+            if (Objects.isNull(runtDataDynamo) || !converterDateToString(converterStringDate(runtDataDynamo.getCreationDate())).equals(converterDateToString(new Date()))) {
+                var params = new HashMap<String, String>();
+                params.put("placa", request.getLicencePlate());
+                params.put("vin", request.getVehicleIdNumber());
+                params.put("tipoDoc", request.getDocumentType());
+                params.put("numDoc", Objects.nonNull(request.getDocumentNumber()) ? request.getDocumentNumber().toString() : null);
+
+                dataRunt = getDataRuntResponse(commonsService.executeGetOkttp(urlCommonsvehicleTrad + urlGetDataRuntv3, params, headers));
+            } else {
+                dataRunt = getDataRuntResponse(runtDataDynamo.getDescription());
+            }
+
+        } catch (IOException ex) {
+            log.info(" Ocurrio un error en validateSearchVehicleData {}", ex);
+            throw new PriceSoatException(CommonsUtil.ERROR_SERVICE_CONSULT_DATA_RUNT);
+        }
+        return dataRunt;
+    }
+3. Metodo que se mockea para simular respuesta de http runt
+    @Override
+    public String executeGetOkttp(String url, Map<String, String> params, Map<String, String> headersList) throws IOException {
+        try {
+            log.info(">>>>> MOCK RUNT ACTIVADO: Cargando JSON simulado<<<<<");
+            return loadMockResponse("mock/runtResponseMock.json");
+            // --- CODIGO DESHABILITADO TEMPORALMENTE LLAMADO A RUNT V3
+
+        } catch (IllegalStateException e) {
+            throw new ConsultRuntException(ERROR_BUILD_RUNT_V3);
+        }
+    }
+4. Adicionales, asi se manejan algunas excepciones en el repo
+@Getter
+@Setter
+@Slf4j
+public class SoatTariffException extends RuntimeException {
+	
+	private static final long serialVersionUID = 1L;
+	
+	@Getter
+	private final List<ErrorSoatTariffDto> errors;
+	
+	/**
+	 * Metodo encargado de transmitir el mensaje
+	 *
+	 * @param message El mensaje a transmitir
+	 */
+	public SoatTariffException(String message) {
+		super(message);
+		errors = new ArrayList<>();
+		errors.add(ErrorSoatTariffDto.builder()
+                .idError(BigDecimal.valueOf(1))
+                .descError(message)
+                .typeError(UtilitiesRunt.ERROR)
+                .msgError(null)
+                .msgError1(message)
+                .build());
+	}
+	
+	/**
+	 * Metodo encargado de transmitir los errores
+	 * @param message Mensaje general del error
+	 * @param errors Lista de errores generados
+	 */
+	public SoatTariffException(String message, List<ErrorSoatTariffDto> errors) {
+		super(message);
+		this.errors=errors;
+	}
+
+}
+5.Adicionales, mock de runt
+{
+  "dataHeader": {
+    "codRespuesta": 1,
+    "errors": [
+      {
+        "idError": -20601,
+        "descError": "Fecha de vencimiento del soat:28/03/2026",
+        "tipoError": "W"
+      }
+    ]
+  },
+  "data": {
+    "clienteBolivar": null,
+    "igPatVeh": "LYC022",
+    "igPais": "90",
+    "igPaisDesc": "480",
+    "igNroLicenciaTransito": "0674658",
+    "igEstadoVehiculo": "",
+    "igEstadoVehiculoDesc": "ACTIVO",
+    "igTipoServicio": "1",
+    "igTipoServicioDesc": "PARTICULAR",
+    "igClaseVehiculo": "1",
+    "igClaseVehiculoDesc": "AUTOMOVIL",
+    "igvMarca": "8",
+    "igvMarcaDesc": "RENAULT",
+    "igvLinea": "804",
+    "igvLineaDesc": "R 9 GTL",
+    "igvModelo": 1985,
+    "igvColor": null,
+    "idColor": null,
+    "igvNumeroSerie": "G000354",
+    "igvNumeroMotor": "M400353",
+    "igvNumeroChasis": "F0100353",
+    "igvNumeroVin": "G000354",
+    "divipola": 5266000,
+    "igvCilindraje": 1400,
+    "igvNroLlantas": null,
+    "igvAlto": null,
+    "igvAncho": null,
+    "igvLargo": null,
+    "igvTipoCarroceria": "9 - SEDAN",
+    "idTipoCarroceria": 9,
+    "igvLimitacionesPropiedad": null,
+    "igvPrendas": "NO",
+    "igvRepotenciado": "NO",
+    "igvClasificacion": "AUTOMOVIL",
+    "igvEsRegrabadoMotor": "NO",
+    "igvNumeroRegrabacionMotor": null,
+    "igvEsRegrabadoChasis": "NO",
+    "igvNumeroRegrabacionChasis": null,
+    "igvEsRegrabadoSerie": "NO",
+    "igvNumeroRegrabacionSerie": null,
+    "igvEsRegrabadoVin": "NO",
+    "igvNumeroRegrabacionVin": null,
+    "dtCapacidadCarga": 0,
+    "dtNumeroEjes": 2,
+    "soatNumeroPoliza": "3379280700",
+    "soatFechaExpedicion": "2025-03-24-00:00",
+    "soatFechaVigencia": "2025-03-29-00:00",
+    "soatFechaVencimiento": "2026-03-28-00:00",
+    "soatEntidadExpide": "AXA COLPATRIA SEGUROS SA",
+    "soatVigente": "VIGENTE",
+    "crTipoRevision": "REVISION TECNICO-MECANICO",
+    "crFechaExpedicion": "2024-05-07-00:00",
+    "crFechaVigencia": "2025-05-07-00:00",
+    "crCdaExpide": "CDA AUTOMOTOS ANTIOQUIA S.A.S",
+    "ibBlindado": "NO",
+    "ibNivelBlindaje": null,
+    "ibFechaBlindaje": null,
+    "ibFechaDesblindaje": null,
+    "riNumeroCertificado": null,
+    "riFechaExpedicion": null,
+    "riEstadoCertificado": null,
+    "riPlacasReposicion": null,
+    "dtNumeroPasajeros": 4,
+    "igvFechaMatricula": "1985-06-14-00:00",
+    "idTipoImportacion": null,
+    "numRegistro": 1018327,
+    "organismoTransito": "STRIA TTEyTTO ENVIGADO",
+    "tipoCombustible": 1,
+    "propietariosActuales": [
+      {
+        "idTipoDocumento": "CC",
+        "tipoDocumento": null,
+        "numeroDocumento": "1075877",
+        "nombreCompleto": "MARIA LORENA PACHON MEDINA",
+        "primerNombre": "MARIA",
+        "segundoNombre": "LORENA",
+        "primerApellido": "PACHON",
+        "segundoApellido": "MEDINA",
+        "tipoPropiedad": null,
+        "detallePropiedad": null,
+        "direcciones": null,
+        "locatarios": null
+      }
+    ]
+  },
+  "logReport": {
+    "tipoConsulta": "SOAT",
+    "existeMaestra": "S",
+    "consultaRunt": "S",
+    "fechaCreacion": "2023-03-31 18:20:30",
+    "fechaModificacion": "2023-10-12 09:37:04",
+    "fechaAntConsulta": "2023-10-12 09:37:04"
+  }
+}
+6.Casos
+6.1 propietario sin cc
+"propietariosActuales": [
+     {
+       "idTipoDocumento": null,
+       "tipoDocumento": null,
+       "numeroDocumento": "96542",
+       "nombreCompleto": null,
+       "primerNombre": null,
+       "segundoNombre": null,
+       "primerApellido": null,
+       "segundoApellido": null,
+       "tipoPropiedad": null,
+       "detallePropiedad": null,
+       "direcciones": null,
+       "locatarios": null
+     }
+6.2 propietario sin info
+"propietariosActuales": [
+            {
+                "idTipoDocumento": "CC",
+                "tipoDocumento": null,
+                "numeroDocumento": "51991776",
+                "nombreCompleto": "SIN INFORMACION  SIN INFORMACION",
+                "primerNombre": "SIN INFORMACION",
+                "segundoNombre": null,
+                "primerApellido": "SIN INFORMACION",
+                "segundoApellido": null,
+                "tipoPropiedad": null,
+                "detallePropiedad": null,
+                "direcciones": null,
+                "locatarios": null
+            }
+6.3 propietario sin info otro ejemplo
+        "propietariosActuales": [
+            {
+                "idTipoDocumento": "CC",
+                "tipoDocumento": null,
+                "numeroDocumento": "66837337",
+                "nombreCompleto": "SIN INFORMACION  SIN INFORMACION",
+                "primerNombre": "SIN INFORMACION",
+                "segundoNombre": null,
+                "primerApellido": "SIN INFORMACION",
+                "segundoApellido": null,
+                "tipoPropiedad": null,
+                "detallePropiedad": null,
+                "direcciones": null,
+                "locatarios": null
+            }
+        ]
+7. las excepciones formato:
+{
+    "dataHeader": {
+        "codRespuesta": -1,
+        "errors": [
+            {
+                "idError": 1,
+                "descError": "Es necesario indicar la placa o el vin.",
+                "tipoError": "E",
+                "msgError": null,
+                "msgError1": "Es necesario indicar la placa o el vin."
+            }
+        ]
+    },
+    "data": null
+}
